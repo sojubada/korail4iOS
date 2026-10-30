@@ -8,6 +8,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "릴리즈 태그 (예: v0.1.0)"
+        required: true
+        default: "v0.1.0"
 
 permissions:
   contents: write   # gh release create 권한
@@ -71,12 +76,23 @@ jobs:
           name: korail4iOS-ipa
           path: dist/*
 
-      - name: 릴리즈 생성 (태그 push 시)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: 릴리즈 생성 (태그 push 또는 수동 실행)
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "korail4iOS ${GITHUB_REF_NAME}" \
-            --notes "개인용 코레일 예약 앱. TrollStore로 설치하세요. 첫 실행 시 코레일 계정으로 로그인(자격증명은 기기 Keychain에만 저장)." \
-            dist/korail4iOS.ipa dist/korail4iOS.tipa
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          # 이미 있으면 자산만 갱신
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/korail4iOS.ipa dist/korail4iOS.tipa --clobber
+          else
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "korail4iOS $TAG" \
+              --notes "개인용 코레일 예약 앱 (로그인/조회/선점). TrollStore로 korail4iOS.tipa 설치. 첫 실행 시 코레일 계정 로그인 — 자격증명은 기기 Keychain에만 저장(앱/릴리즈에 미포함). 결제는 선점까지, 최종 결제는 공식앱/웹. 본인 사용 전용." \
+              dist/korail4iOS.ipa dist/korail4iOS.tipa
+          fi
