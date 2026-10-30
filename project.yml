@@ -35,3 +35,12 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.rob.korail4iOS
         CODE_SIGNING_ALLOWED: "NO"
         TARGETED_DEVICE_FAMILY: "1"
+schemes:
+  korail4iOS:
+    build:
+      targets:
+        korail4iOS: all
+    run:
+      config: Release
+    archive:
+      config: Release

@@ -1,0 +1,70 @@
+name: Build & Release (.ipa)
+
+# 미서명 IPA를 macOS 러너에서 빌드해 릴리즈에 첨부한다(TrollStore 설치용).
+# - 수동 실행(workflow_dispatch) 또는 태그 push('v*')로 트리거
+# - 이 리눅스 세션엔 Xcode가 없어 빌드는 여기(macOS 러너)서 이뤄진다.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # gh release create 권한
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: XcodeGen 설치
+        run: brew install xcodegen
+
+      - name: 프로젝트 생성
+        run: xcodegen generate
+
+      - name: 미서명 빌드
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project korail4iOS.xcodeproj \
+            -scheme korail4iOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log | \
+            grep -E "error:|warning:|BUILD" || true
+          # 실패 시 에러만 모아서 요약에 노출
+          if ! grep -q "BUILD SUCCEEDED" build.log; then
+            echo "## 빌드 실패 — error 줄" >> "$GITHUB_STEP_SUMMARY"
+            grep -E "error:" build.log | head -50 >> "$GITHUB_STEP_SUMMARY" || true
+            exit 1
+          fi
+
+      - name: IPA 포장
+        run: |
+          APP="build/Build/Products/Release-iphoneos/korail4iOS.app"
+          test -d "$APP" || { echo "앱 번들 없음: $APP"; exit 1; }
+          rm -rf Payload dist && mkdir -p Payload dist
+          cp -R "$APP" Payload/
+          (cd . && zip -qr dist/korail4iOS.ipa Payload)
+          cp dist/korail4iOS.ipa dist/korail4iOS.tipa
+          ls -la dist
+
+      - name: 아티팩트 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: korail4iOS-ipa
+          path: dist/*
+
+      - name: 릴리즈 생성 (태그 push 시)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "korail4iOS ${GITHUB_REF_NAME}" \
+            --notes "개인용 코레일 예약 앱. TrollStore로 설치하세요. 첫 실행 시 코레일 계정으로 로그인(자격증명은 기기 Keychain에만 저장)." \
+            dist/korail4iOS.ipa dist/korail4iOS.tipa
