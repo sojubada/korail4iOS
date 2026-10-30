@@ -18,11 +18,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Xcode 선택 (최신 안정판)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: 환경 점검
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
       - name: XcodeGen 설치
         run: brew install xcodegen
 
       - name: 프로젝트 생성
-        run: xcodegen generate
+        run: |
+          xcodegen generate
+          xcodebuild -list -project korail4iOS.xcodeproj || true
 
       - name: 미서명 빌드
         run: |
