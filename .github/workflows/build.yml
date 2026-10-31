@@ -1,0 +1,24 @@
+name: Build dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: # 수동 실행 버튼 활성화
+
+jobs:
+  build:
+    runs-on: macos-latest # GitHub의 무료 macOS 서버 사용
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Compile VersionSpoof.dylib
+      run: |
+        xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=15.0 -dynamiclib -framework Foundation VersionSpoof.m -o VersionSpoof.dylib
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: VersionSpoof-dylib
+        path: VersionSpoof.dylib
