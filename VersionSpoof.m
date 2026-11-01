@@ -3,35 +3,67 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
+#import <mach/mach.h>
+#import <dlfcn.h>
 #import <errno.h>
 #import <string.h>
 
 // ==========================================
-// 1. fork() 및 getenv() 후킹 함수 정의
+// 1. C 함수 후킹 (fork / getenv) 및 안전한 메모리 쓰기
 // ==========================================
 
-static char *(*orig_getenv)(const char *name) = NULL;
-
-// fork() 호출 시 일반 앱 샌드박스처럼 실패(-1) 및 EPERM 반환
 static pid_t hooked_fork(void) {
     errno = EPERM;
     return -1;
 }
 
-// checkRuntime의 DYLD 환경변수 탐지 우회
 static char *hooked_getenv(const char *name) {
     if (name && (strstr(name, "DYLD_") != NULL)) {
         return NULL;
     }
-    return orig_getenv ? orig_getenv(name) : NULL;
+    static char *(*real_getenv)(const char *) = NULL;
+    if (!real_getenv) {
+        real_getenv = (char *(*)(const char *))dlsym(RTLD_NEXT, "getenv");
+    }
+    return real_getenv ? real_getenv(name) : NULL;
+}
+
+// PRT/MAX가 r--/rw- 인 __DATA_CONST 영역을 안전하게 수정
+static void safe_write_pointer(void **target, void *replacement) {
+    vm_address_t addr = (vm_address_t)target;
+    vm_address_t page_start = trunc_page(addr);
+    vm_size_t page_size = vm_page_size;
+
+    // 1차 시도: MAX 권한(rw-)에 맞춰 VM_PROT_COPY 없이 요청
+    kern_return_t kr = vm_protect(mach_task_self(), page_start, page_size, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE);
+    if (kr != KERN_SUCCESS) {
+        // 2차 시도: 공유 페이지일 경우 VM_PROT_COPY 포함 요청
+        kr = vm_protect(mach_task_self(), page_start, page_size, FALSE,
+                        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    }
+
+    if (kr == KERN_SUCCESS) {
+        *target = replacement;
+        // 수정 후 다시 읽기 전용(r--)으로 복원
+        vm_protect(mach_task_self(), page_start, page_size, FALSE, VM_PROT_READ);
+    }
 }
 
 // ==========================================
-// 2. Mach-O 심볼 테이블 리바인딩 (fishhook 원리)
+// 2. iScreenSAFER 전용 심볼 리바인딩
 // ==========================================
 
 static void rebind_symbols_for_image(const struct mach_header *header, intptr_t slide) {
     if (header->magic != MH_MAGIC_64) return;
+
+    Dl_info info;
+    if (dladdr(header, &info) == 0 || !info.dli_fname) return;
+
+    // Korail 메인 바이너리 등 불필요한 이미지는 건너뛰고 iScreenSAFER만 정밀 타겟팅
+    if (strstr(info.dli_fname, "iScreenSAFER") == NULL) {
+        return;
+    }
 
     struct mach_header_64 *header64 = (struct mach_header_64 *)header;
     struct load_command *cmd = (struct load_command *)((uintptr_t)header64 + sizeof(struct mach_header_64));
@@ -54,7 +86,7 @@ static void rebind_symbols_for_image(const struct mach_header *header, intptr_t 
         cmd = (struct load_command *)((uintptr_t)cmd + cmd->cmdsize);
     }
 
-    if (!symtab_cmd || !dysymtab_cmd || !linkedit_segment) return;
+    if (!symtab_cmd || !dysymtab_cmd || !linkedit_segment || dysymtab_cmd->nindirectsyms == 0) return;
 
     uintptr_t linkedit_base = (uintptr_t)slide + linkedit_segment->vmaddr - linkedit_segment->fileoff;
     struct nlist_64 *symtab = (struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
@@ -80,14 +112,17 @@ static void rebind_symbols_for_image(const struct mach_header *header, intptr_t 
                                 symtab_index == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) {
                                 continue;
                             }
+                            if (symtab_index >= symtab_cmd->nsyms) continue;
+
                             uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
+                            if (strtab_offset >= symtab_cmd->strsize) continue;
+
                             char *symbol_name = strtab + strtab_offset;
 
                             if (strcmp(symbol_name, "_fork") == 0) {
-                                indirect_symbol_bindings[k] = (void *)hooked_fork;
+                                safe_write_pointer(&indirect_symbol_bindings[k], (void *)hooked_fork);
                             } else if (strcmp(symbol_name, "_getenv") == 0) {
-                                if (!orig_getenv) orig_getenv = (typeof(orig_getenv))indirect_symbol_bindings[k];
-                                indirect_symbol_bindings[k] = (void *)hooked_getenv;
+                                safe_write_pointer(&indirect_symbol_bindings[k], (void *)hooked_getenv);
                             }
                         }
                     }
@@ -99,7 +134,56 @@ static void rebind_symbols_for_image(const struct mach_header *header, intptr_t 
 }
 
 // ==========================================
-// 3. NSBundle 버전 패치 (5.1.1) 및 초기화
+// 3. Objective-C 탐지 메서드 직접 무력화 (return NO)
+// ==========================================
+
+static BOOL return_false_imp(id self, SEL _cmd) {
+    return NO;
+}
+
+static void hook_objc_Methods_if_present(void) {
+    int numClasses = objc_getClassList(NULL, 0);
+    if (numClasses <= 0) return;
+
+    Class *classes = (__unsafe_unretained Class *)malloc(sizeof(Class) * numClasses);
+    numClasses = objc_getClassList(classes, numClasses);
+
+    SEL targets[] = {
+        sel_registerName("isJailBroken"),
+        sel_registerName("isSandboxIntegrityCompromised"),
+        sel_registerName("checkRuntime"),
+        sel_registerName("isJailBreakFilesExist"),
+        sel_registerName("checkURLSchemes"),
+        sel_registerName("checkRestrictedDirectoriesWritable"),
+        sel_registerName("isSymbolicLink")
+    };
+    size_t targetCount = sizeof(targets) / sizeof(targets[0]);
+
+    for (int i = 0; i < numClasses; i++) {
+        const char *className = class_getName(classes[i]);
+        // Swift 네임스페이스가 붙은 경우(예: iScreenSAFER.JailbreakSimulatorChecker)까지 모두 포함하여 검색
+        if (strstr(className, "JailbreakSimulatorChecker") != NULL ||
+            strstr(className, "iScreenSAFER") != NULL) {
+            Class cls = classes[i];
+            Class metaCls = object_getClass(cls);
+
+            for (size_t t = 0; t < targetCount; t++) {
+                Method instM = class_getInstanceMethod(cls, targets[t]);
+                if (instM) method_setImplementation(instM, (IMP)return_false_imp);
+
+                Method clsM = class_getClassMethod(cls, targets[t]);
+                if (clsM) method_setImplementation(clsM, (IMP)return_false_imp);
+                
+                Method metaM = class_getInstanceMethod(metaCls, targets[t]);
+                if (metaM) method_setImplementation(metaM, (IMP)return_false_imp);
+            }
+        }
+    }
+    free(classes);
+}
+
+// ==========================================
+// 4. NSBundle 버전 패치 (5.1.1) 및 초기화
 // ==========================================
 
 @implementation NSBundle (VersionSpoof)
@@ -107,21 +191,18 @@ static void rebind_symbols_for_image(const struct mach_header *header, intptr_t 
 + (void)load {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        // 1) 로드되는 모든 바이너리/프레임워크(iScreenSAFER 포함)에 fork 및 getenv 후킹 등록
-        _dyld_register_func_for_add_image(rebind_symbols_for_image);
-
-        // 2) NSBundle 버전 스푸핑 (4.17.0 -> 5.1.1)
+        // 1) 버전 스푸핑 (5.1.1)
         Class cls = [NSBundle class];
-        
-        SEL origSel1 = @selector(objectForInfoDictionaryKey:);
-        SEL swizSel1 = @selector(spoof_objectForInfoDictionaryKey:);
-        method_exchangeImplementations(class_getInstanceMethod(cls, origSel1),
-                                       class_getInstanceMethod(cls, swizSel1));
-        
-        SEL origSel2 = @selector(infoDictionary);
-        SEL swizSel2 = @selector(spoof_infoDictionary);
-        method_exchangeImplementations(class_getInstanceMethod(cls, origSel2),
-                                       class_getInstanceMethod(cls, swizSel2));
+        method_exchangeImplementations(class_getInstanceMethod(cls, @selector(objectForInfoDictionaryKey:)),
+                                       class_getInstanceMethod(cls, @selector(spoof_objectForInfoDictionaryKey:)));
+        method_exchangeImplementations(class_getInstanceMethod(cls, @selector(infoDictionary)),
+                                       class_getInstanceMethod(cls, @selector(spoof_infoDictionary)));
+
+        // 2) Objective-C/Swift(@objc) 탐지 메서드 무력화
+        hook_objc_Methods_if_present();
+
+        // 3) iScreenSAFER 프레임워크 전용 C 심볼(fork, getenv) 후킹
+        _dyld_register_func_for_add_image(rebind_symbols_for_image);
     });
 }
 
